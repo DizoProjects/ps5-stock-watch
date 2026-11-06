@@ -40,25 +40,32 @@ IN_SCHEMA = {"InStock", "LimitedAvailability", "PreOrder", "BackOrder", "OnlineO
 OUT_SCHEMA = {"OutOfStock", "SoldOut", "Discontinued"}
 
 
+BUY_WORDS = re.compile(r"add to (cart|basket)|buy now|sign in to (order|buy|purchase)|pre-?order|checkout", re.I)
+
+
 def classify_html(html):
     """
-    Uses two machine-maintained signals, not the page's prose: the product's schema.org availability
-    (kept accurate for Google Shopping) and the buy button's price slot. The description text
-    ("Currently Out of stock...") is written by hand and can lag a restock, and "Not available for purchase"
-    sits in a translations list that's always on the page, so neither is trusted.
-    In stock if EITHER signal says so (a stale signal can't hide a drop); out only if no signal says in.
+    In stock ONLY when the page shows a working buy button: <button data-qa="mfeCtaMain#cta#action">Add to Cart</button>,
+    not disabled. That's the button you'd click, so if the watcher says IN, you can buy.
+    The product data (schema.org InStock) and the price slot can flip minutes before the button does, while the
+    page still says "Not available for purchase": that's what caused false alerts. They're now only noted.
     """
     schema = set(re.findall(r"schema\.org/(\w+)", html)) & (IN_SCHEMA | OUT_SCHEMA)
     m = re.search(r'data-qa="mfeCtaMain#offer0#finalPrice"[^>]*>([^<]*)<', html)
-    cta = m.group(1).strip() if m else None
-    ins = []
+    price = m.group(1).strip() if m else None
+    b = re.search(r'<button\b([^>]*data-qa="mfeCtaMain#cta#action"[^>]*)>(.*?)</button>', html, re.S)
+    btn_text = re.sub(r"<[^>]+>|\s+", " ", b.group(2)).strip() if b else ""
+    btn_live = bool(b) and not re.search(r'\bdisabled\b|aria-disabled="true"', b.group(1)) and bool(BUY_WORDS.search(btn_text))
+    if btn_live:
+        return IN, f"'{btn_text}' button is live" + (f" at {price}" if price and "£" in price else "")
+    early = []
     if schema & IN_SCHEMA:
-        ins.append(f"product data says {'/'.join(sorted(schema & IN_SCHEMA))}")
-    if cta and "£" in cta:
-        ins.append(f"buy button shows a price ({cta})")
-    if ins:
-        return IN, "; ".join(ins)
-    if schema & OUT_SCHEMA or (cta and "not available" in cta.lower()):
+        early.append(f"product data says {'/'.join(sorted(schema & IN_SCHEMA))}")
+    if price and "£" in price:
+        early.append(f"price shows {price}")
+    if early:  # stock data is moving but you can't buy yet: logged, not alerted
+        return OUT, "not buyable yet, but " + " and ".join(early) + (f"; button says '{btn_text}'" if btn_text else "")
+    if schema & OUT_SCHEMA or (price and "not available" in price.lower()) or "mfeCtaMain" in html:
         return OUT, ""
     return UNKNOWN, "couldn't find the stock data or buy button on the page"
 
